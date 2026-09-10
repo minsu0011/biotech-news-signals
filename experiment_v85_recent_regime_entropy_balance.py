@@ -1,0 +1,870 @@
+"""V85 recent-regime entropy-balanced causal-state direction challenger.
+
+For each embargoed market training cut, only causal pre-decision numeric market
+state is robustly standardized.  The latest chronological 25% of that *past*
+cut defines an unlabeled deployment-regime reference.  A deterministic convex
+entropy-tilting problem reweights the complete past to balance first and clipped
+second state moments against that reference.  A class-balanced ridge logistic
+direction head is then fit with those weights.  No target-batch features,
+target labels, source/ticker/category, text, retrieval, kernel, RFF, graph,
+tree, neural representation, or additive shape basis is used.
+
+Earlier same-market committed V69 OOF labels alone select exact V69 or fixed
+0.25/0.50 logit blends.  Outer labels are evaluation-only, every split has a
+strict 35-minute embargo, and V69 confidence/high_conf are immutable.  The
+controller recomputes all canonical 14 gates.  Material failure restores the
+exact entire atomic V69 frame.
+"""
+from __future__ import annotations
+
+import argparse
+import gzip
+import hashlib
+import json
+import math
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+# Conservative defaults are set before numerical libraries load.  A future
+# authorized full runner may override these in its parent environment.
+for _name in (
+    "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS",
+):
+    os.environ.setdefault(_name, "4")
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from scipy.special import expit, logit
+from sklearn.metrics import balanced_accuracy_score, roc_auc_score
+from threadpoolctl import threadpool_info, threadpool_limits
+
+import autonomous_v37plus as controller
+import experiment_v44_microstructure as v44
+
+
+ROOT = Path(__file__).resolve().parent
+DEV_PATH = ROOT / "data" / "dev_contract_v36_labeled.csv.gz"
+V69_DIR = ROOT / "output_V69"
+V69_PATH = V69_DIR / "V69_FAIL_CLOSED_SELECTED_OOF.csv.gz"
+CONTROLLER_OUTPUT = os.environ.get("MARKET_BIO_VERSION_OUTPUT")
+DEFAULT_OUT = (
+    Path(CONTROLLER_OUTPUT)
+    if CONTROLLER_OUTPUT
+    else ROOT / "staging" / "V85_RECENT_REGIME_ENTROPY_BALANCE_V1"
+)
+
+VERSION = 85
+HYPOTHESIS = "RECENT_REGIME_ENTROPY_BALANCED_CAUSAL_STATE_DIRECTION_V1"
+EXPECTED_V36_SHA256 = "2152090f9c83f233f0abe0fcb4fdb4b1a50cee27da99b27865f8eda83c8d65e2"
+EXPECTED_V69_EXPERIMENT_ID = "445e21fc752036c96446e571d0c182a99624d1ab261ea9db72e14911d3d30740"
+EXPECTED_V36_ROWS = 9462
+EXPECTED_V69_ROWS = 7568
+EXPECTED_MARKET_FOLD_ROWS = {"US": 1595, "KR": 297}
+EMBARGO = pd.Timedelta(minutes=35)
+INNER_VALID_FRACTION = 0.30
+RECENT_REFERENCE_FRACTION = 0.25
+ROBUST_CLIP = 5.0
+MOMENT_SQUARE_CLIP = 3.0
+ENTROPY_L2 = 0.08
+LOGISTIC_L2 = 0.12
+WEIGHT_RATIO_FLOOR = 0.05
+WEIGHT_RATIO_CAP = 20.0
+SEED = 8501
+BOOTSTRAP_DRAWS = 2000
+SMOKE_THREADS = 4
+COST = 0.002
+
+# Strictly numeric pre-decision price/volume/benchmark state.  Contemporaneous
+# entry bars, event keywords, lengths, and all categorical identifiers are
+# deliberately excluded.
+FEATURES = (
+    "pre_ret_1", "pre_ret_2", "pre_ret_5", "pre_ret_10", "pre_ret_15",
+    "pre_ret_30", "pre_ret_60", "pre_ret_120",
+    "pre_vol_5", "pre_vol_10", "pre_vol_30", "pre_vol_60",
+    "volume_ratio_1_30", "volume_ratio_2_30", "volume_ratio_5_30",
+    "volume_ratio_10_60", "range_5m", "range_10m", "range_30m", "range_60m",
+    "close_position_10", "close_position_30", "close_position_60",
+    "intraday_ret_open", "return_autocorr_30", "up_fraction_10",
+    "up_fraction_30", "trend_slope_30", "trend_slope_60",
+    "vwap_distance_30", "minutes_from_open", "minutes_to_close",
+    "benchmark_ret_2", "benchmark_ret_5", "benchmark_ret_15",
+    "benchmark_ret_30", "benchmark_ret_60",
+)
+
+ARCHITECTURES = (
+    {"name": "ENTROPY_BALANCED_LOGIT_W0.25", "weight": 0.25},
+    {"name": "ENTROPY_BALANCED_LOGIT_W0.50", "weight": 0.50},
+)
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise RuntimeError(message)
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def array_sha256(values: np.ndarray) -> str:
+    return hashlib.sha256(np.ascontiguousarray(values).view(np.uint8)).hexdigest()
+
+
+def finite(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def clean(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): clean(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [clean(item) for item in value]
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        return finite(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    return value
+
+
+def bool_series(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_bool_dtype(series):
+        return series.astype(bool)
+    return series.map(lambda value: str(value).strip().lower() in {"1", "true", "yes"}).astype(bool)
+
+
+def safe_auc(target: np.ndarray, score: np.ndarray) -> float | None:
+    target = np.asarray(target, int)
+    return float(roc_auc_score(target, np.asarray(score, float))) if np.unique(target).size == 2 else None
+
+
+def atomic_bytes(payload: bytes, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + f".tmp.{os.getpid()}")
+    temporary.write_bytes(payload)
+    os.replace(temporary, path)
+
+
+def atomic_json(payload: Any, path: Path) -> None:
+    raw = json.dumps(clean(payload), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    atomic_bytes(raw.encode("utf-8"), path)
+
+
+def atomic_csv(frame: pd.DataFrame, path: Path) -> None:
+    raw = frame.to_csv(index=False, lineterminator="\n").encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + f".tmp.{os.getpid()}")
+    if path.name.endswith(".gz"):
+        with temporary.open("wb") as handle:
+            with gzip.GzipFile(filename="", mode="wb", fileobj=handle, mtime=0) as compressed:
+                compressed.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+    else:
+        temporary.write_bytes(raw)
+    os.replace(temporary, path)
+
+
+def verify_authority() -> dict[str, Any]:
+    commit_path = V69_DIR / "COMMIT.json"
+    manifest_path = V69_DIR / "ARTIFACT_MANIFEST.json"
+    require(sha256(DEV_PATH) == EXPECTED_V36_SHA256, "immutable V36 DEV hash changed")
+    require(commit_path.is_file() and manifest_path.is_file(), "V69 atomic authority incomplete")
+    commit = json.loads(commit_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    require(commit.get("version") == 69, "V69 COMMIT version mismatch")
+    require(commit.get("experiment_id") == EXPECTED_V69_EXPERIMENT_ID, "V69 experiment changed")
+    require(commit.get("manifest_sha256") == sha256(manifest_path), "V69 manifest binding changed")
+    require(commit.get("data_sha") == EXPECTED_V36_SHA256, "V69 not bound to immutable V36 DEV")
+    require(manifest.get("experiment_id") == EXPECTED_V69_EXPERIMENT_ID, "V69 manifest experiment changed")
+    for name, item in manifest.get("files", {}).items():
+        path = V69_DIR / name
+        require(path.is_file(), f"V69 manifested artifact missing: {name}")
+        require(path.stat().st_size == int(item["bytes"]), f"V69 artifact size changed: {name}")
+        require(sha256(path) == item["sha256"], f"V69 artifact hash changed: {name}")
+    require(V69_PATH.name in manifest.get("files", {}), "V69 selected OOF not manifested")
+    return {
+        "authority": "immutable V36 DEV + atomic output_V69",
+        "authorized_inputs": [
+            str(DEV_PATH.relative_to(ROOT)), str(commit_path.relative_to(ROOT)),
+            str(manifest_path.relative_to(ROOT)), str(V69_PATH.relative_to(ROOT)),
+        ],
+        "v36_sha256": EXPECTED_V36_SHA256,
+        "v69_commit_sha256": sha256(commit_path),
+        "v69_manifest_sha256": sha256(manifest_path),
+        "v69_oof_sha256": sha256(V69_PATH),
+        "manifest_files_verified": len(manifest.get("files", {})),
+        "failed_output_loaded": False, "dev_extension_loaded": False,
+        "role_assignment_loaded": False, "research_seal_loaded": False,
+        "final_reserve_loaded": False,
+    }
+
+
+def load_authorized() -> tuple[pd.DataFrame, pd.DataFrame]:
+    dev = pd.read_csv(
+        DEV_PATH, compression="gzip", low_memory=False, dtype={"ticker": str},
+        parse_dates=["event_time_utc"],
+    )
+    champion = pd.read_csv(
+        V69_PATH, compression="gzip", low_memory=False, dtype={"ticker": str},
+        parse_dates=["event_time_utc"],
+    )
+    require(len(dev) == EXPECTED_V36_ROWS and len(champion) == EXPECTED_V69_ROWS, "authority row count changed")
+    require(dev.event_id.is_unique and champion.event_id.is_unique, "event_id uniqueness failed")
+    require(set(champion.event_id).issubset(set(dev.event_id)), "V69 is not a V36 subset")
+    aligned = dev.set_index("event_id").loc[champion.event_id].reset_index()
+    require(np.array_equal(aligned.y.to_numpy(int), champion.y.to_numpy(int)), "V36/V69 labels differ")
+    require(np.allclose(aligned.fwd_ret_30m, champion.fwd_ret_30m, rtol=0.0, atol=1e-15), "V36/V69 returns differ")
+    require(all(column in dev.columns for column in FEATURES), "V85 causal numeric feature missing")
+    dev["event_time_utc"] = pd.to_datetime(dev.event_time_utc, utc=True)
+    champion["event_time_utc"] = pd.to_datetime(champion.event_time_utc, utc=True)
+    champion["high_conf"] = bool_series(champion.high_conf)
+    return dev.sort_values(["event_time_utc", "event_id"], kind="stable").reset_index(drop=True), champion
+
+
+def cluster_weights(frame: pd.DataFrame) -> np.ndarray:
+    counts = frame.groupby("event_group_id").event_id.transform("size").to_numpy(float)
+    weights = 1.0 / np.maximum(counts, 1.0)
+    return weights / weights.sum()
+
+
+class RobustNumericState:
+    def __init__(self) -> None:
+        self.median = np.empty(0)
+        self.scale = np.empty(0)
+
+    def fit(self, frame: pd.DataFrame) -> "RobustNumericState":
+        raw = frame.loc[:, FEATURES].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+        self.median = np.nanmedian(raw, axis=0)
+        lower = np.nanquantile(raw, 0.25, axis=0)
+        upper = np.nanquantile(raw, 0.75, axis=0)
+        scale = upper - lower
+        fallback = np.nanstd(raw, axis=0)
+        self.scale = np.where(np.isfinite(scale) & (scale > 1e-9), scale, np.where(fallback > 1e-9, fallback, 1.0))
+        require(np.isfinite(self.median).all() and np.isfinite(self.scale).all(), "robust numeric fit is non-finite")
+        return self
+
+    def transform(self, frame: pd.DataFrame) -> np.ndarray:
+        raw = frame.loc[:, FEATURES].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+        filled = np.where(np.isfinite(raw), raw, self.median)
+        result = np.clip((filled - self.median) / self.scale, -ROBUST_CLIP, ROBUST_CLIP)
+        require(np.isfinite(result).all(), "robust numeric transform is non-finite")
+        return result
+
+
+def entropy_balance(train: pd.DataFrame, matrix: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+    n = len(train)
+    recent_start = max(1, int(math.floor(n * (1.0 - RECENT_REFERENCE_FRACTION))))
+    require(n - recent_start >= 50, "recent reference is too small")
+    base = cluster_weights(train)
+    recent_base = cluster_weights(train.iloc[recent_start:])
+    raw_moments = np.concatenate([matrix, np.square(np.clip(matrix, -MOMENT_SQUARE_CLIP, MOMENT_SQUARE_CLIP))], axis=1)
+    base_mean = np.sum(base[:, None] * raw_moments, axis=0)
+    base_var = np.sum(base[:, None] * np.square(raw_moments - base_mean), axis=0)
+    active = np.sqrt(np.maximum(base_var, 0.0)) > 1e-7
+    require(int(active.sum()) >= len(FEATURES), "too few active balance moments")
+    scale = np.sqrt(base_var[active])
+    standardized = (raw_moments[:, active] - base_mean[active]) / scale
+    target = np.sum(recent_base[:, None] * standardized[recent_start:], axis=0)
+
+    def objective(parameter: np.ndarray) -> tuple[float, np.ndarray]:
+        score = standardized @ parameter
+        maximum = float(np.max(score))
+        unnormalized = base * np.exp(score - maximum)
+        total = float(unnormalized.sum())
+        probability = unnormalized / total
+        loss = maximum + math.log(total) - float(target @ parameter)
+        loss += 0.5 * ENTROPY_L2 * float(parameter @ parameter)
+        gradient = standardized.T @ probability - target + ENTROPY_L2 * parameter
+        return loss, gradient
+
+    initial = np.zeros(standardized.shape[1], dtype=float)
+    result = minimize(
+        objective, initial, method="L-BFGS-B", jac=True,
+        bounds=[(-3.0, 3.0)] * len(initial),
+        options={"maxiter": 250, "ftol": 1e-10, "gtol": 1e-6, "maxls": 30},
+    )
+    require(np.isfinite(result.x).all() and math.isfinite(float(result.fun)), "entropy balance optimization failed")
+    score = standardized @ result.x
+    score -= float(np.max(score))
+    ratio = np.exp(score)
+    ratio /= max(float(np.sum(base * ratio)), 1e-12)
+    ratio = np.clip(ratio, WEIGHT_RATIO_FLOOR, WEIGHT_RATIO_CAP)
+    weights = base * ratio
+    weights /= weights.sum()
+    post = standardized.T @ weights
+    pre_error = float(np.sqrt(np.mean(np.square(target))))
+    post_error = float(np.sqrt(np.mean(np.square(post - target))))
+    ess = float(1.0 / np.sum(np.square(weights)))
+    return weights, {
+        "optimization": "convex label-free entropy tilting",
+        "success": bool(result.success), "status": int(result.status),
+        "message": str(result.message), "iterations": int(result.nit),
+        "objective": float(result.fun), "train_n": n,
+        "recent_reference_n": n - recent_start,
+        "recent_reference_fraction": RECENT_REFERENCE_FRACTION,
+        "reference_uses_past_features_only": True,
+        "reference_uses_labels": False, "outer_target_features_used": False,
+        "active_balance_moments": int(active.sum()),
+        "pre_balance_rms": pre_error, "post_balance_rms": post_error,
+        "balance_improvement_ratio": post_error / max(pre_error, 1e-12),
+        "effective_sample_size": ess, "effective_sample_fraction": ess / n,
+        "weight_ratio_min": float(np.min(weights / np.maximum(base, 1e-15))),
+        "weight_ratio_max": float(np.max(weights / np.maximum(base, 1e-15))),
+        "weights_sha256": array_sha256(weights),
+    }
+
+
+def fit_weighted_logistic(matrix: np.ndarray, target: np.ndarray, weights: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+    target = np.asarray(target, float)
+    weights = np.asarray(weights, float)
+    counts = np.bincount(target.astype(int), minlength=2).astype(float)
+    require((counts > 0).all(), "weighted logistic training has one class")
+    class_factor = np.where(target > 0.5, len(target) / (2.0 * counts[1]), len(target) / (2.0 * counts[0]))
+    weights = weights * class_factor
+    weights /= weights.sum()
+    design = np.column_stack([np.ones(len(matrix)), matrix])
+
+    def objective(coefficient: np.ndarray) -> tuple[float, np.ndarray]:
+        score = design @ coefficient
+        loss = float(np.sum(weights * (np.logaddexp(0.0, score) - target * score)))
+        gradient = design.T @ (weights * (expit(score) - target))
+        loss += 0.5 * LOGISTIC_L2 * float(coefficient[1:] @ coefficient[1:])
+        gradient[1:] += LOGISTIC_L2 * coefficient[1:]
+        return loss, gradient
+
+    initial = np.zeros(design.shape[1], dtype=float)
+    initial[0] = float(logit(np.clip(np.average(target, weights=weights), 1e-5, 1.0 - 1e-5)))
+    result = minimize(
+        objective, initial, method="L-BFGS-B", jac=True,
+        options={"maxiter": 300, "ftol": 1e-10, "gtol": 1e-6, "maxls": 30},
+    )
+    require(np.isfinite(result.x).all() and math.isfinite(float(result.fun)), "weighted logistic optimization failed")
+    return result.x, {
+        "success": bool(result.success), "status": int(result.status),
+        "message": str(result.message), "iterations": int(result.nit),
+        "objective": float(result.fun), "coefficient_n": len(result.x),
+        "ridge_l2": LOGISTIC_L2,
+    }
+
+
+def entropy_direction(train: pd.DataFrame, target: pd.DataFrame) -> tuple[np.ndarray, dict[str, Any]]:
+    require(train.market.nunique() == 1 and target.market.nunique() == 1, "V85 expects one market per fit")
+    require(str(train.market.iloc[0]) == str(target.market.iloc[0]), "V85 market fit mismatch")
+    state = RobustNumericState().fit(train)
+    train_matrix = state.transform(train)
+    target_matrix = state.transform(target)
+    weights, balance_audit = entropy_balance(train, train_matrix)
+    coefficient, logistic_audit = fit_weighted_logistic(train_matrix, train.y.to_numpy(int), weights)
+    probability = expit(coefficient[0] + target_matrix @ coefficient[1:])
+    require(np.isfinite(probability).all(), "V85 probability is non-finite")
+    probability = np.clip(probability, 1e-5, 1.0 - 1e-5)
+    return probability, {
+        "market": str(train.market.iloc[0]), "train_n": len(train), "target_n": len(target),
+        "feature_n": len(FEATURES), "causal_numeric_only": True,
+        "categorical_feature_n": 0, "text_feature_n": 0,
+        "ticker_feature": False, "source_feature": False,
+        "interaction_terms": 0, "kernel_or_rff": False,
+        "entropy_balance": balance_audit, "weighted_logistic": logistic_audit,
+        "probability_sha256": array_sha256(probability),
+    }
+
+
+def blend_probability(baseline: np.ndarray, challenger: np.ndarray, weight: float) -> np.ndarray:
+    left = logit(np.clip(np.asarray(baseline, float), 1e-5, 1.0 - 1e-5))
+    right = logit(np.clip(np.asarray(challenger, float), 1e-5, 1.0 - 1e-5))
+    return expit((1.0 - weight) * left + weight * right)
+
+
+def metric(frame: pd.DataFrame, probability: np.ndarray, confidence: np.ndarray, high: np.ndarray) -> dict[str, Any]:
+    probability = np.asarray(probability, float)
+    prediction = probability >= 0.5
+    target = frame.y.to_numpy(int)
+    confidence = np.asarray(confidence, float)
+    high = np.asarray(high, bool)
+    correct = (prediction == target).astype(int)
+    signed_net = np.where(prediction, 1.0, -1.0) * frame.fwd_ret_30m.to_numpy(float) - COST
+    return {
+        "n": len(frame), "auc": float(roc_auc_score(target, probability)),
+        "balanced_accuracy": float(balanced_accuracy_score(target, prediction)),
+        "accuracy": float(correct.mean()), "pred_up": float(prediction.mean()),
+        "all_trade_mean_signed_net": float(signed_net.mean()),
+        "confidence_correctness_auc": safe_auc(correct, confidence),
+        "highconf_n": int(high.sum()),
+        "highconf_accuracy": float(correct[high].mean()) if high.any() else None,
+        "highconf_mean_signed_net": float(signed_net[high].mean()) if high.any() else None,
+    }
+
+
+def chronology(train: pd.DataFrame, valid: pd.DataFrame, label: str) -> dict[str, Any]:
+    require(len(train) and len(valid), f"{label}: empty split")
+    train_end = pd.Timestamp(train.event_time_utc.max())
+    valid_start = pd.Timestamp(valid.event_time_utc.min())
+    require(train_end < valid_start - EMBARGO, f"{label}: strict 35-minute embargo failed")
+    overlap = set(train.event_group_id.astype(str)) & set(valid.event_group_id.astype(str))
+    require(not overlap, f"{label}: event-group leakage")
+    return {
+        "train_n": len(train), "valid_n": len(valid), "train_end": train_end,
+        "valid_start": valid_start, "embargo_minutes": 35,
+        "event_group_overlap_n": 0, "strict_35m_embargo": True,
+    }
+
+
+def aligned_dev(dev: pd.DataFrame, champion_rows: pd.DataFrame) -> pd.DataFrame:
+    aligned = dev.set_index("event_id").loc[champion_rows.event_id].reset_index()
+    require(np.array_equal(aligned.y.to_numpy(int), champion_rows.y.to_numpy(int)), "aligned labels differ")
+    return aligned
+
+
+def prior_train(dev: pd.DataFrame, market: str, boundary: pd.Timestamp, valid: pd.DataFrame) -> pd.DataFrame:
+    train = dev.loc[dev.market.eq(market) & (dev.event_time_utc < boundary - EMBARGO)].copy()
+    train = train.loc[~train.event_group_id.astype(str).isin(set(valid.event_group_id.astype(str)))].copy()
+    return train.sort_values(["event_time_utc", "event_id"], kind="stable").reset_index(drop=True)
+
+
+def inner_partition(
+    dev: pd.DataFrame, champion: pd.DataFrame, market: str, outer_start: pd.Timestamp,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    prior = champion.loc[champion.market.eq(market) & (champion.event_time_utc < outer_start - EMBARGO)].copy()
+    prior = prior.sort_values(["event_time_utc", "event_id"], kind="stable")
+    require(len(prior) >= (1000 if market == "US" else 220), f"insufficient prior {market} OOF")
+    split = int(math.floor(len(prior) * (1.0 - INNER_VALID_FRACTION)))
+    inner_champion = prior.iloc[split:].copy()
+    inner_valid = aligned_dev(dev, inner_champion)
+    inner_start = pd.Timestamp(inner_valid.event_time_utc.min())
+    inner_train = prior_train(dev, market, inner_start, inner_valid)
+    require(len(inner_train) >= (700 if market == "US" else 250), "inner V85 training cut too small")
+    audit = chronology(inner_train, inner_valid, f"V85 inner {market}")
+    audit["validation_source"] = "earlier same-market committed V69 OOF IDs"
+    audit["selection_uses_inner_labels_only"] = True
+    return inner_train, inner_valid, inner_champion, audit
+
+
+def choose_inner(
+    inner_train: pd.DataFrame, inner_valid: pd.DataFrame, inner_champion: pd.DataFrame,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    challenger, model_audit = entropy_direction(inner_train, inner_valid)
+    baseline = inner_champion.prob.to_numpy(float)
+    confidence = inner_champion.confidence_signal.to_numpy(float)
+    high = bool_series(inner_champion.high_conf).to_numpy(bool)
+    baseline_metric = metric(inner_valid, baseline, confidence, high)
+    trials = [{
+        "name": "V69_NOOP", "architecture": None, "metrics": baseline_metric,
+        "auc_delta": 0.0, "balanced_accuracy_delta": 0.0,
+        "all_trade_net_delta": 0.0, "eligible": True,
+        "score": float(2.0 * baseline_metric["auc"] + baseline_metric["balanced_accuracy"] + 10.0 * baseline_metric["all_trade_mean_signed_net"]),
+    }]
+    balance = model_audit["entropy_balance"]
+    balance_eligible = bool(
+        balance["success"]
+        and balance["effective_sample_fraction"] >= 0.15
+        and balance["post_balance_rms"] < balance["pre_balance_rms"]
+        and model_audit["weighted_logistic"]["success"]
+    )
+    for architecture in ARCHITECTURES:
+        probability = blend_probability(baseline, challenger, architecture["weight"])
+        values = metric(inner_valid, probability, confidence, high)
+        auc_delta = values["auc"] - baseline_metric["auc"]
+        ba_delta = values["balanced_accuracy"] - baseline_metric["balanced_accuracy"]
+        net_delta = values["all_trade_mean_signed_net"] - baseline_metric["all_trade_mean_signed_net"]
+        trials.append({
+            "name": architecture["name"], "architecture": architecture,
+            "metrics": values, "auc_delta": auc_delta,
+            "balanced_accuracy_delta": ba_delta, "all_trade_net_delta": net_delta,
+            "balance_eligible": balance_eligible,
+            "eligible": bool(balance_eligible and ba_delta >= -0.005 and net_delta >= -0.0005),
+            "score": float(2.0 * values["auc"] + values["balanced_accuracy"] + 10.0 * values["all_trade_mean_signed_net"]),
+        })
+    selected = max(
+        (trial for trial in trials if trial["eligible"]),
+        key=lambda trial: (trial["score"], trial["auc_delta"], trial["all_trade_net_delta"], trial["name"] == "V69_NOOP"),
+    )
+    return {
+        "selection_rule": "inner-past OOF only; exact no-op or fixed .25/.50 entropy-balanced logit blend; maximize 2*AUC+BA+10*net with fixed balance/BA/net eligibility",
+        "baseline": baseline_metric, "selected": selected, "trials": trials,
+        "outer_labels_used_for_selection": False,
+    }, model_audit
+
+
+def run_nested(
+    dev: pd.DataFrame, champion: pd.DataFrame, smoke: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[dict[str, Any]]]:
+    diagnostic = champion.copy()
+    diagnostic["v85_model"] = "V69_NOOP"
+    evidence_parts: list[pd.DataFrame] = []
+    audits: list[dict[str, Any]] = []
+    fold_specs = [(market, fold) for market in ("US", "KR") for fold in (2, 3, 4)]
+    for market, fold in (fold_specs[:1] if smoke else fold_specs):
+        outer_champion = champion.loc[champion.market.eq(market) & champion.fold.eq(fold)].copy()
+        outer_champion = outer_champion.sort_values(["event_time_utc", "event_id"], kind="stable")
+        require(len(outer_champion) == EXPECTED_MARKET_FOLD_ROWS[market], f"{market} fold {fold} size changed")
+        outer_valid = aligned_dev(dev, outer_champion)
+        outer_start = pd.Timestamp(outer_valid.event_time_utc.min())
+        outer_train = prior_train(dev, market, outer_start, outer_valid)
+        outer_chronology = chronology(outer_train, outer_valid, f"V85 outer {market} fold {fold}")
+        inner_train, inner_valid, inner_champion, inner_chronology = inner_partition(dev, champion, market, outer_start)
+        policy, inner_model_audit = choose_inner(inner_train, inner_valid, inner_champion)
+        challenger, outer_model_audit = entropy_direction(outer_train, outer_valid)
+        baseline = outer_champion.prob.to_numpy(float)
+        confidence = outer_champion.confidence_signal.to_numpy(float)
+        high = bool_series(outer_champion.high_conf).to_numpy(bool)
+        selected = policy["selected"]
+        candidate = baseline.copy() if selected["architecture"] is None else blend_probability(
+            baseline, challenger, selected["architecture"]["weight"],
+        )
+        positions = diagnostic.index[diagnostic.event_id.isin(set(outer_valid.event_id))]
+        probability_map = dict(zip(outer_valid.event_id, candidate))
+        diagnostic.loc[positions, "prob"] = diagnostic.loc[positions, "event_id"].map(probability_map)
+        diagnostic.loc[positions, "v85_model"] = selected["name"]
+        outer_diagnostics = {
+            architecture["name"]: metric(
+                outer_valid, blend_probability(baseline, challenger, architecture["weight"]),
+                confidence, high,
+            ) for architecture in ARCHITECTURES
+        }
+        base_metric = metric(outer_valid, baseline, confidence, high)
+        candidate_metric = metric(outer_valid, candidate, confidence, high)
+        evidence = outer_champion[[
+            "event_id", "event_group_id", "event_time_utc", "market", "ticker",
+            "source_family", "fold", "y", "fwd_ret_30m", "confidence_signal", "high_conf",
+        ]].copy()
+        evidence["baseline_prob"] = baseline
+        evidence["entropy_direction_prob"] = challenger
+        evidence["candidate_prob"] = candidate
+        evidence["v85_model"] = selected["name"]
+        evidence_parts.append(evidence)
+        audits.append({
+            "market": market, "fold": fold,
+            "inner_chronology": inner_chronology, "outer_chronology": outer_chronology,
+            "policy": policy, "inner_model_audit": inner_model_audit,
+            "outer_model_audit": outer_model_audit,
+            "outer_architecture_diagnostics_evaluation_only": outer_diagnostics,
+            "outer_baseline": base_metric, "outer_candidate": candidate_metric,
+            "outer_auc_delta": candidate_metric["auc"] - base_metric["auc"],
+            "outer_ba_delta": candidate_metric["balanced_accuracy"] - base_metric["balanced_accuracy"],
+            "outer_net_delta": candidate_metric["all_trade_mean_signed_net"] - base_metric["all_trade_mean_signed_net"],
+            "policy_locked_before_outer_evaluation": True,
+            "outer_labels_used_for_selection": False,
+        })
+        print(
+            f"[V85 ENTROPY] market={market} fold={fold} selected={selected['name']} "
+            f"inner_auc_delta={selected['auc_delta']:+.6f} outer_auc_delta={audits[-1]['outer_auc_delta']:+.6f}",
+            flush=True,
+        )
+    evidence = pd.concat(evidence_parts, ignore_index=True)
+    require(evidence.event_id.is_unique, "V85 evidence repeats an event")
+    require(np.array_equal(champion.confidence_signal.to_numpy(float), diagnostic.confidence_signal.to_numpy(float)), "V85 changed V69 confidence")
+    require(np.array_equal(champion.high_conf.to_numpy(bool), diagnostic.high_conf.to_numpy(bool)), "V85 changed V69 high-confidence")
+    return diagnostic, evidence, audits
+
+
+def paired_bootstrap(evidence: pd.DataFrame, draws: int) -> dict[str, Any]:
+    work = evidence.copy()
+    timestamp = pd.to_datetime(work.event_time_utc, utc=True)
+    work["block"] = np.where(work.market.eq("US"), timestamp.dt.strftime("US|%Y-%m"), timestamp.dt.strftime("KR|%Y-%m-%d"))
+    blocks = [part for _, part in work.groupby(["market", "fold", "block"], sort=True)]
+    require(len(blocks) >= 12, "too few V85 bootstrap blocks")
+    generator = np.random.default_rng(SEED)
+    auc_delta: list[float] = []
+    ba_delta: list[float] = []
+    net_delta: list[float] = []
+    for _ in range(draws):
+        sample = pd.concat([blocks[index] for index in generator.integers(0, len(blocks), len(blocks))])
+        target = sample.y.to_numpy(int)
+        if np.unique(target).size != 2:
+            continue
+        base = sample.baseline_prob.to_numpy(float)
+        candidate = sample.candidate_prob.to_numpy(float)
+        auc_delta.append(float(roc_auc_score(target, candidate) - roc_auc_score(target, base)))
+        ba_delta.append(float(balanced_accuracy_score(target, candidate >= 0.5) - balanced_accuracy_score(target, base >= 0.5)))
+        returns = sample.fwd_ret_30m.to_numpy(float)
+        net_delta.append(float(np.mean(np.where(candidate >= 0.5, 1.0, -1.0) * returns) - np.mean(np.where(base >= 0.5, 1.0, -1.0) * returns)))
+    require(len(auc_delta) >= int(0.90 * draws), "V85 bootstrap lost too many draws")
+
+    def interval(values: list[float]) -> dict[str, Any]:
+        array = np.asarray(values, float)
+        return {
+            "effective_draws": len(array), "lower95": float(np.quantile(array, 0.025)),
+            "median": float(np.median(array)), "upper95": float(np.quantile(array, 0.975)),
+            "probability_gt_zero": float(np.mean(array > 0.0)),
+        }
+
+    return {
+        "method": "paired market-time block bootstrap over inner-locked entropy-balanced policy",
+        "seed": SEED, "requested_draws": draws, "blocks": len(blocks),
+        "auc_delta": interval(auc_delta), "balanced_accuracy_delta": interval(ba_delta),
+        "all_trade_net_delta": interval(net_delta),
+    }
+
+
+def evaluate(
+    champion: pd.DataFrame, diagnostic: pd.DataFrame, evidence: pd.DataFrame,
+    audits: list[dict[str, Any]], draws: int,
+) -> dict[str, Any]:
+    baseline_report = json.loads((V69_DIR / "DEV_ROBUSTNESS_REPORT.json").read_text(encoding="utf-8"))
+    baseline_summary = baseline_report["selected"]
+    diagnostic_original = diagnostic[list(champion.columns)].copy()
+    candidate_summary = v44.summarize(diagnostic_original)
+    canonical_baseline = controller.canonical_research_gate(baseline_summary)
+    canonical_candidate = controller.canonical_research_gate(candidate_summary)
+    require(canonical_baseline["total"] == canonical_candidate["total"] == 14, "controller canonical gate is not 14")
+    require(baseline_summary["research_gate"] == canonical_baseline, "V69/controller gate mismatch")
+    require(candidate_summary["research_gate"] == canonical_candidate, "V85/controller gate mismatch")
+    base = metric(evidence, evidence.baseline_prob, evidence.confidence_signal, bool_series(evidence.high_conf))
+    candidate = metric(evidence, evidence.candidate_prob, evidence.confidence_signal, bool_series(evidence.high_conf))
+    bootstrap = paired_bootstrap(evidence, draws)
+    fold_auc = np.asarray([audit["outer_auc_delta"] for audit in audits], float)
+    fold_net = np.asarray([audit["outer_net_delta"] for audit in audits], float)
+    base_metrics = baseline_summary["metrics"]
+    candidate_metrics = candidate_summary["metrics"]
+    confidence_exact = np.array_equal(champion.confidence_signal.to_numpy(float), diagnostic_original.confidence_signal.to_numpy(float)) and np.array_equal(champion.high_conf.to_numpy(bool), diagnostic_original.high_conf.to_numpy(bool))
+    balance_valid = all(
+        audit["outer_model_audit"]["causal_numeric_only"]
+        and audit["outer_model_audit"]["entropy_balance"]["success"]
+        and audit["outer_model_audit"]["entropy_balance"]["reference_uses_past_features_only"]
+        and not audit["outer_model_audit"]["entropy_balance"]["reference_uses_labels"]
+        and not audit["outer_model_audit"]["entropy_balance"]["outer_target_features_used"]
+        and audit["outer_model_audit"]["entropy_balance"]["post_balance_rms"] < audit["outer_model_audit"]["entropy_balance"]["pre_balance_rms"]
+        and audit["outer_model_audit"]["entropy_balance"]["effective_sample_fraction"] >= 0.15
+        and audit["outer_model_audit"]["weighted_logistic"]["success"]
+        for audit in audits
+    )
+    checks = {
+        "all_six_market_folds_evaluated": len(audits) == 6,
+        "outer_auc_delta_gt_0_003": candidate["auc"] - base["auc"] > 0.003,
+        "outer_balanced_accuracy_delta_gt_0": candidate["balanced_accuracy"] - base["balanced_accuracy"] > 0.0,
+        "outer_all_trade_net_delta_ge_0": candidate["all_trade_mean_signed_net"] - base["all_trade_mean_signed_net"] >= 0.0,
+        "positive_outer_fold_auc_fraction_ge_2_of_3": float(np.mean(fold_auc > 0.0)) >= 2.0 / 3.0,
+        "nonnegative_outer_fold_net_fraction_ge_2_of_3": float(np.mean(fold_net >= 0.0)) >= 2.0 / 3.0,
+        "bootstrap_auc_delta_probability_gt_zero_ge_0_75": bootstrap["auc_delta"]["probability_gt_zero"] >= 0.75,
+        "bootstrap_net_delta_probability_gt_zero_ge_0_65": bootstrap["all_trade_net_delta"]["probability_gt_zero"] >= 0.65,
+        "full_overall_auc_delta_gt_0_001": candidate_metrics["auc"] - base_metrics["auc"] > 0.001,
+        "full_overall_ba_delta_ge_minus_0_001": candidate_metrics["balanced_accuracy"] - base_metrics["balanced_accuracy"] >= -0.001,
+        "hc_accuracy_delta_ge_minus_0_005": candidate_metrics["highconf_accuracy"] - base_metrics["highconf_accuracy"] >= -0.005,
+        "hc_net_delta_ge_minus_0_0005": candidate_metrics["strategy_mean_signed_net"] - base_metrics["strategy_mean_signed_net"] >= -0.0005,
+        "v69_confidence_and_highconf_exact": confidence_exact,
+        "strict_nested_chronology_all_folds": all(
+            audit["outer_chronology"]["strict_35m_embargo"]
+            and audit["inner_chronology"]["strict_35m_embargo"]
+            and not audit["outer_labels_used_for_selection"] for audit in audits
+        ),
+        "entropy_balance_contract_verified": balance_valid,
+    }
+    material_pass = bool(all(checks.values()))
+    selected = diagnostic_original if material_pass else champion.copy()
+    selected_summary = candidate_summary if material_pass else baseline_summary
+    canonical_selected = controller.canonical_research_gate(selected_summary)
+    require(canonical_selected["total"] == 14 and selected_summary["research_gate"] == canonical_selected, "selected/controller gate mismatch")
+    if not material_pass:
+        require(selected.equals(champion), "V85 fallback is not exact complete V69")
+    return {
+        "status": "MATERIAL_PASS" if material_pass else "MATERIAL_EXPERIMENT_FAIL_EXACT_V69_FALLBACK",
+        "material_pass": material_pass, "material_checks": checks,
+        "outer_baseline": base, "outer_candidate": candidate,
+        "outer_auc_delta": candidate["auc"] - base["auc"],
+        "outer_ba_delta": candidate["balanced_accuracy"] - base["balanced_accuracy"],
+        "outer_net_delta": candidate["all_trade_mean_signed_net"] - base["all_trade_mean_signed_net"],
+        "bootstrap": bootstrap, "baseline_summary": baseline_summary,
+        "candidate_summary": candidate_summary, "selected_summary": selected_summary,
+        "canonical_gate_audit": {
+            "baseline": canonical_baseline, "candidate": canonical_candidate,
+            "selected": canonical_selected, "reported_equals_controller_recomputed": True,
+        },
+        "immutability": {
+            "confidence_exact": confidence_exact,
+            "baseline_confidence_sha256": array_sha256(champion.confidence_signal.to_numpy(float)),
+            "candidate_confidence_sha256": array_sha256(diagnostic_original.confidence_signal.to_numpy(float)),
+            "baseline_highconf_sha256": array_sha256(champion.high_conf.to_numpy(bool)),
+            "candidate_highconf_sha256": array_sha256(diagnostic_original.high_conf.to_numpy(bool)),
+        },
+        "fallback": {
+            "activated": not material_pass,
+            "policy": "exact V69 entire frame" if not material_pass else None,
+            "exact_frame_verified": bool(material_pass or selected.equals(champion)),
+        },
+        "diagnostic_frame": diagnostic_original, "selected_frame": selected,
+    }
+
+
+def write_outputs(
+    authority: dict[str, Any], evidence: pd.DataFrame, audits: list[dict[str, Any]],
+    evaluation: dict[str, Any], out: Path,
+) -> dict[str, Any]:
+    out.mkdir(parents=True, exist_ok=True)
+    compact = {key: value for key, value in evaluation.items() if not key.endswith("_frame")}
+    selected_contract = json.loads(json.dumps(clean(evaluation["selected_summary"])))
+    selected_contract["material_gate"] = {
+        "contract": HYPOTHESIS,
+        "checks": evaluation["material_checks"],
+        "passed": int(sum(evaluation["material_checks"].values())),
+        "total": len(evaluation["material_checks"]),
+        "material_pass": evaluation["material_pass"],
+    }
+    reports = {
+        "MODEL_COMPARISON.json": {
+            "version": "V85", "hypothesis": HYPOTHESIS, "status": evaluation["status"],
+            "models": {
+                "V69_CHAMPION": evaluation["baseline_summary"],
+                "V85_DIAGNOSTIC_ENTROPY_BALANCE": evaluation["candidate_summary"],
+                "V85_FAIL_CLOSED_SELECTED": selected_contract,
+            },
+            "evaluation": compact, "authority_audit": authority,
+            "seal_authorized": False,
+        },
+        "DEV_ROBUSTNESS_REPORT.json": {
+            "version": "V85", "hypothesis": HYPOTHESIS, "status": evaluation["status"],
+            "opened_dev_only": True, "selected": selected_contract,
+            "candidate": evaluation["candidate_summary"],
+            "material_checks": evaluation["material_checks"],
+            "fallback_is_exact_v69": not evaluation["material_pass"],
+            "fallback_is_exact_entire_v69_frame": not evaluation["material_pass"],
+            "seal_authorized": False,
+        },
+        "SOURCE_TRANSFER_REPORT.json": {
+            "version": "V85", "hypothesis": HYPOTHESIS, "status": evaluation["status"],
+            "selected_by_source_family": selected_contract["metrics"]["by_source_family"],
+            "candidate_by_source_family": evaluation["candidate_summary"]["metrics"]["by_source_family"],
+            "selected_by_market": selected_contract["metrics"]["by_market"],
+            "candidate_by_market": evaluation["candidate_summary"]["metrics"]["by_market"],
+            "outer": {
+                "auc_delta": evaluation["outer_auc_delta"],
+                "balanced_accuracy_delta": evaluation["outer_ba_delta"],
+                "net_delta": evaluation["outer_net_delta"],
+            },
+            "fallback_is_exact_v69": not evaluation["material_pass"],
+            "seal_authorized": False,
+        },
+        "RECENT_REGIME_ENTROPY_BALANCE_REPORT.json": {
+            "version": "V85", "hypothesis": HYPOTHESIS, "features": FEATURES,
+            "architectures": ARCHITECTURES, "nested_fold_audits": audits,
+            "evaluation": compact, "authority_audit": authority,
+        },
+        "CANONICAL_RESEARCH_GATE_AUDIT.json": {
+            "version": "V85", "status": "MATCH", "canonical_check_count": 14,
+            "reported": evaluation["selected_summary"]["research_gate"],
+            "controller_recomputed": evaluation["canonical_gate_audit"]["selected"],
+        },
+        "RUN_STATUS.json": {
+            "version": VERSION, "hypothesis": HYPOTHESIS, "status": evaluation["status"],
+            "material_pass": evaluation["material_pass"],
+            "champion_changed": evaluation["material_pass"],
+            "phase": "ROBUST_SURVIVOR" if evaluation["selected_summary"]["research_gate"]["robust_survivor"] else "RESEARCH_FAIL",
+            "seal_state": "UNOPENED", "seal_authorized": False, "completed_at": now(),
+        },
+    }
+    for name, payload in reports.items():
+        atomic_json(payload, out / name)
+    atomic_csv(pd.DataFrame([{
+        "market": audit["market"], "fold": audit["fold"],
+        "selected_model": audit["policy"]["selected"]["name"],
+        "outer_auc_delta": audit["outer_auc_delta"],
+        "outer_ba_delta": audit["outer_ba_delta"],
+        "outer_net_delta": audit["outer_net_delta"],
+        "pre_balance_rms": audit["outer_model_audit"]["entropy_balance"]["pre_balance_rms"],
+        "post_balance_rms": audit["outer_model_audit"]["entropy_balance"]["post_balance_rms"],
+        "effective_sample_fraction": audit["outer_model_audit"]["entropy_balance"]["effective_sample_fraction"],
+        "strict_35m_embargo": True, "outer_labels_used_for_selection": False,
+    } for audit in audits]), out / "V85_ENTROPY_BALANCE_FOLD_AUDIT.csv")
+    atomic_csv(evidence, out / "V85_ENTROPY_BALANCED_OUTER_EVIDENCE.csv.gz")
+    atomic_csv(evaluation["diagnostic_frame"], out / "V85_DIAGNOSTIC_ENTROPY_BALANCE_OOF.csv.gz")
+    atomic_csv(evaluation["selected_frame"], out / "V85_FAIL_CLOSED_SELECTED_OOF.csv.gz")
+    files = {}
+    for path in sorted(out.iterdir()):
+        if path.is_file() and path.name != "ARTIFACT_MANIFEST.json":
+            files[path.name] = {"sha256": sha256(path), "bytes": path.stat().st_size}
+    atomic_json({
+        "version": VERSION, "hypothesis": HYPOTHESIS,
+        "authority_experiment_id": EXPECTED_V69_EXPERIMENT_ID, "files": files,
+    }, out / "ARTIFACT_MANIFEST.json")
+    return {
+        "output": str(out), "artifact_count": len(files) + 1,
+        "manifest_sha256": sha256(out / "ARTIFACT_MANIFEST.json"),
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--audit-only", action="store_true")
+    modes.add_argument("--smoke-test", action="store_true")
+    modes.add_argument("--full-run", action="store_true")
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUT)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    authority = verify_authority()
+    dev, champion = load_authorized()
+    if args.audit_only:
+        print(json.dumps(clean({
+            "status": "AUDIT_OK", "hypothesis": HYPOTHESIS,
+            "authority": authority, "dev_rows": len(dev), "v69_rows": len(champion),
+            "features": FEATURES, "feature_n": len(FEATURES),
+            "causal_numeric_only": True, "categorical_feature_n": 0,
+            "text_feature_n": 0, "target_batch_features_used": False,
+            "recent_reference_fraction": RECENT_REFERENCE_FRACTION,
+            "canonical_controller_gate_checks": 14,
+            "resource_policy": {
+                "smoke_cpu_thread_cap": SMOKE_THREADS, "gpu_model_calls": 0,
+                "reason": "bounded CPU smoke avoids contention with the active V78 GPU full run",
+            },
+            "output_written": False,
+        }), ensure_ascii=False, indent=2))
+        return
+    limit = SMOKE_THREADS if args.smoke_test else None
+    with threadpool_limits(limits=limit):
+        diagnostic, evidence, audits = run_nested(dev, champion, smoke=args.smoke_test)
+        evaluation = evaluate(champion, diagnostic, evidence, audits, 250 if args.smoke_test else BOOTSTRAP_DRAWS)
+    non_noop = [trial for trial in audits[0]["policy"]["trials"] if trial["architecture"] is not None]
+    best_non_noop = max(non_noop, key=lambda trial: (trial["eligible"], trial["score"], trial["auc_delta"]))
+    summary = {
+        "status": "SMOKE_OK" if args.smoke_test else evaluation["status"],
+        "hypothesis": HYPOTHESIS, "folds_executed": len(audits),
+        "selected_models": [audit["policy"]["selected"]["name"] for audit in audits],
+        "outer_auc_delta": evaluation["outer_auc_delta"],
+        "outer_ba_delta": evaluation["outer_ba_delta"],
+        "outer_net_delta": evaluation["outer_net_delta"],
+        "material_pass": evaluation["material_pass"],
+        "fallback_is_exact_v69": not evaluation["material_pass"],
+        "canonical_gate": evaluation["selected_summary"]["research_gate"],
+        "resource_evidence": {
+            "threadpool_limit": limit, "gpu_model_calls": 0,
+            "threadpools": threadpool_info(),
+        },
+        "output_written": False,
+    }
+    if args.smoke_test:
+        summary["raw_inner_selected"] = audits[0]["policy"]["selected"]
+        summary["raw_inner_best_non_noop"] = best_non_noop
+        summary["raw_outer_baseline"] = audits[0]["outer_baseline"]
+        summary["raw_outer_selected"] = audits[0]["outer_candidate"]
+        summary["raw_outer_best_non_noop_evaluation_only"] = audits[0]["outer_architecture_diagnostics_evaluation_only"][best_non_noop["name"]]
+        summary["entropy_balance_audit"] = audits[0]["outer_model_audit"]
+        print(json.dumps(clean(summary), ensure_ascii=False, indent=2))
+        return
+    result = write_outputs(authority, evidence, audits, evaluation, args.output)
+    print(json.dumps(clean({**summary, "output_written": True, "controller": result}), ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
