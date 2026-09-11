@@ -44,7 +44,7 @@ publisher/topic reliability는 과거 label만 사용한 신뢰도 추정이며,
 
 별도 opportunity dual gate는 정확도 61.54%였지만 단 13건, coverage 1.68%였고 순수익도 음수였다. 이 숫자만으로 성공했다고 판단하지 않았다.
 
-V224 초기 진단과 historical BASE V1은 평가 조건이 달라 직접적인 개선치로 비교하지 않았다. 시장과 publisher가 얽힌 표본 구성, 독립 다중 출처 부족, 과거 ingest 시각 증명 부족이 남아 있다. 200개가 넘는 실험은 [계열별 문서](docs/wiki/Model-Evolution.md)로 묶었다.
+V224 초기 진단과 historical BASE V1은 평가 조건이 달라 직접적인 개선치로 비교하지 않았다. 시장과 publisher가 얽힌 표본 구성, 독립 다중 출처 부족, 과거 ingest 시각 증명 부족이 남아 있다. 200개가 넘는 실험은 [계열별 문서](https://github.com/minsu0011/biotech-news-signals/wiki/Model-Evolution)로 묶었다.
 
 ## 시작하기
 
@@ -56,4 +56,6 @@ python bio_news_30m_v3.py --help
 
 ## 상세 문서
 
-[연구 안내](docs/wiki/Home.md) · [개발 과정](docs/wiki/Development-Journey.md) · [실험 계열](docs/wiki/Model-Evolution.md) · [수집·시각 병목](docs/wiki/Data-and-Features.md) · [신뢰도 실험 결정](docs/wiki/Experiments-and-Decisions.md) · [결과](docs/wiki/Validation-and-Results.md)
+[연구 안내](https://github.com/minsu0011/biotech-news-signals/wiki/Home) · [개발 과정](https://github.com/minsu0011/biotech-news-signals/wiki/Development-Journey) · [실험 계열](https://github.com/minsu0011/biotech-news-signals/wiki/Model-Evolution) · [수집·시각 병목](https://github.com/minsu0011/biotech-news-signals/wiki/Data-and-Features) · [신뢰도 실험 결정](https://github.com/minsu0011/biotech-news-signals/wiki/Experiments-and-Decisions) · [결과](https://github.com/minsu0011/biotech-news-signals/wiki/Validation-and-Results)
+
+문서의 저장소 내부 사본은 [docs/wiki](docs/wiki)에 함께 보관한다.
